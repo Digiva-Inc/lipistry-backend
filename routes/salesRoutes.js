@@ -12,7 +12,7 @@ const query = (sql, params) => new Promise((resolve, reject) => {
 
 // Create Sale
 router.post("/create", authenticateAndAuthorize(), async (req, res) => {
-  const { date, bill_no, customer_name, vehicle_no, driver_name, driver_number, transporter_name, lr_number, items } = req.body;
+  const { date, bill_no, customer_name, vehicle_no, driver_name, driver_number, transporter_name, lr_number, items, status } = req.body;
 
   if (!date || !bill_no || !customer_name || !driver_name) {
     return res.status(400).json({ success: false, message: "Missing required fields" });
@@ -45,8 +45,8 @@ router.post("/create", authenticateAndAuthorize(), async (req, res) => {
     const basicQuantity = itemsToProcess[0]?.quantity || 0;
     const created_by = req.user.name;
 
-    const insertQuery = "INSERT INTO sales (date, bill_no, customer_name, vehicle_no, driver_name, driver_number, transporter_name, lr_number, product_code, quantity, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    const insertResult = await query(insertQuery, [date, bill_no, customer_name, vehicle_no || "", driver_name, driver_number || "", transporter_name || "", lr_number || "", basicProductCode, basicQuantity, created_by]);
+    const insertQuery = "INSERT INTO sales (date, bill_no, customer_name, vehicle_no, driver_name, driver_number, transporter_name, lr_number, product_code, quantity, created_by, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const insertResult = await query(insertQuery, [date, bill_no, customer_name, vehicle_no || "", driver_name, driver_number || "", transporter_name || "", lr_number || "", basicProductCode, basicQuantity, created_by, status || "pending"]);
     const salesId = insertResult.insertId;
 
     for (const item of itemsToProcess) {
@@ -190,6 +190,92 @@ router.get("/read", authenticateAndAuthorize(), (req, res) => {
       res.json({ success: true, data: salesWithItems });
     });
   });
+});
+
+
+router.put("/update-status/:id", authenticateAndAuthorize(), async (req, res) => {
+  const salesId = req.params.id;
+  const { status } = req.body;
+
+  if (!status) {
+    return res.status(400).json({
+      success: false,
+      message: "Status is required",
+    });
+  }
+
+  try {
+    // Get old sale
+    const salesResult = await query(
+      "SELECT * FROM sales WHERE id = ?",
+      [salesId]
+    );
+
+    if (salesResult.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Sale not found",
+      });
+    }
+
+    const sale = salesResult[0];
+    const oldStatus = sale.status;
+
+    // Get sale items
+    const items = await query(
+      "SELECT * FROM sales_items WHERE sales_id = ?",
+      [salesId]
+    );
+
+    // =========================
+    // STOCK LOGIC
+    // =========================
+
+    // pending -> stock_in/completed
+    if (
+      oldStatus === "pending" &&
+      (status === "stock_in" || status === "completed")
+    ) {
+      for (const item of items) {
+        await query(
+          "UPDATE product SET quantity = quantity - ? WHERE product_code = ?",
+          [item.quantity, item.product_code]
+        );
+      }
+    }
+
+    // stock_in/completed -> pending
+    if (
+      (oldStatus === "stock_in" || oldStatus === "completed") &&
+      status === "pending"
+    ) {
+      for (const item of items) {
+        await query(
+          "UPDATE product SET quantity = quantity + ? WHERE product_code = ?",
+          [item.quantity, item.product_code]
+        );
+      }
+    }
+
+    // Update status
+    await query(
+      "UPDATE sales SET status = ? WHERE id = ?",
+      [status, salesId]
+    );
+
+    res.json({
+      success: true,
+      message: "Sales status updated successfully",
+    });
+  } catch (err) {
+    console.error("Status Update Error:", err);
+
+    res.status(500).json({
+      success: false,
+      message: "Status Update Error",
+      error: err.message,
+    });
+  }
 });
 
 module.exports = router;
