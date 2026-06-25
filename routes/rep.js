@@ -8,21 +8,26 @@ const path = require('path');
 const fs = require('fs');
 const cloudinary = require('../config/cloudinary');
 
-// Configure local file uploads directory
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadPath = path.join(__dirname, '../uploads');
-    if (!fs.existsSync(uploadPath)) {
-      fs.mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Configure memory storage for multer uploads
+const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
+
+// Helper to upload buffer to Cloudinary
+const uploadFromBuffer = (fileBuffer, folder) => {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: folder },
+      (error, result) => {
+        if (result) {
+          resolve(result);
+        } else {
+          reject(error);
+        }
+      }
+    );
+    stream.end(fileBuffer);
+  });
+};
 
 // Apply JWT authentication and Rep role restriction
 router.use(authenticateToken);
@@ -831,9 +836,6 @@ router.post('/orders/:id/return', upload.single('file'), async (req, res) => {
   const { reason, description } = req.body;
 
   if (!reason || !description) {
-    if (req.file) {
-      try { fs.unlinkSync(req.file.path); } catch (e) {}
-    }
     return res.status(400).json({ error: 'Return reason and description are required.' });
   }
 
@@ -843,24 +845,12 @@ router.post('/orders/:id/return', upload.single('file'), async (req, res) => {
 
   let proofUrl = '';
   try {
-    // Upload to Cloudinary
-    const result = await cloudinary.uploader.upload(req.file.path, {
-      folder: 'Lipistry/returns'
-    });
+    // Upload memory buffer to Cloudinary
+    const result = await uploadFromBuffer(req.file.buffer, 'Lipistry/returns');
     proofUrl = result.secure_url;
-    
-    // Delete temporary local file
-    try {
-      fs.unlinkSync(req.file.path);
-    } catch (err) {
-      console.error('Failed to delete temp file:', err);
-    }
   } catch (cloudinaryError) {
     console.error('Cloudinary return proof upload failed:', cloudinaryError);
-    if (req.file && fs.existsSync(req.file.path)) {
-      try { fs.unlinkSync(req.file.path); } catch (e) {}
-    }
-    return res.status(500).json({ error: `Failed to upload return proof image: ${cloudinaryError.message}` });
+    return res.status(500).json({ error: `Cloudinary return proof upload failed: ${cloudinaryError.message}` });
   }
 
   try {
