@@ -10,21 +10,26 @@ const path = require('path');
 const fs = require('fs');
 const cloudinary = require('../config/cloudinary');
 
-// Configure local file uploads directory
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadPath = path.join(__dirname, '../uploads');
-    if (!fs.existsSync(uploadPath)) {
-      fs.mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Configure memory storage for multer uploads
+const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
+
+// Helper to upload buffer to Cloudinary
+const uploadFromBuffer = (fileBuffer, folder) => {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: folder },
+      (error, result) => {
+        if (result) {
+          resolve(result);
+        } else {
+          reject(error);
+        }
+      }
+    );
+    stream.end(fileBuffer);
+  });
+};
 
 // Apply auth and admin check to all routes here
 router.use(authenticateToken);
@@ -342,31 +347,19 @@ router.post('/products/upload', upload.array('files'), async (req, res) => {
     
     const urls = [];
     for (const file of req.files) {
-      // Upload to Cloudinary
-      const result = await cloudinary.uploader.upload(file.path, {
-        folder: 'Lipistry/products'
-      });
-      urls.push(result.secure_url);
-      
-      // Delete temporary local file
       try {
-        fs.unlinkSync(file.path);
-      } catch (err) {
-        console.error('Failed to delete temp file:', err);
+        // Upload memory buffer to Cloudinary
+        const result = await uploadFromBuffer(file.buffer, 'Lipistry/products');
+        urls.push(result.secure_url);
+      } catch (cloudinaryError) {
+        console.error('Cloudinary product upload failed:', cloudinaryError);
+        return res.status(500).json({ error: `Cloudinary product upload failed: ${cloudinaryError.message}` });
       }
     }
     
     return res.status(200).json({ urls });
   } catch (error) {
-    console.error('Error uploading product images to Cloudinary:', error);
-    // Cleanup any uploaded files that haven't been deleted
-    if (req.files) {
-      for (const file of req.files) {
-        if (fs.existsSync(file.path)) {
-          try { fs.unlinkSync(file.path); } catch (e) {}
-        }
-      }
-    }
+    console.error('Error in product uploads route:', error);
     return res.status(500).json({ error: `Failed to upload images: ${error.message}` });
   }
 });
