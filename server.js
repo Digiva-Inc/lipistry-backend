@@ -20,7 +20,7 @@ if (!fs.existsSync(uploadsDir)) {
 
 // Enable CORS for frontend integration
 app.use(cors({
-  origin: '*', // For development, allow any origin. In production, lock this down.
+  origin: process.env.CLIENT_URL || '*', // Dynamically allow CLIENT_URL from env, fall back to '*'
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
