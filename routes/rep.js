@@ -20,6 +20,7 @@ const uploadFromBuffer = (fileBuffer, folder) => {
       (error, result) => {
         if (result) {
           resolve(result);
+          
         } else {
           reject(error);
         }
