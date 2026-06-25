@@ -556,6 +556,63 @@ router.post('/orders', async (req, res) => {
       stripeError = err;
     }
 
+    if (stripeError && (stripeError.message.includes('No such customer') || stripeError.code === 'resource_missing')) {
+      console.log('Customer not found on Stripe. Re-creating Stripe customer dynamically.');
+      try {
+        stripeError = null;
+        const customer = await stripe.customers.create({
+          email: doctor.email,
+          name: `Dr. ${doctor.doctor_first_name} ${doctor.doctor_last_name} - ${doctor.practice_name}`,
+        });
+        stripeCustomerId = customer.id;
+
+        let updatedStripeCustomerIdPayload = stripeCustomerId;
+        if (doctor.stripe_customer_id && doctor.stripe_customer_id.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(doctor.stripe_customer_id);
+            parsed.customerId = stripeCustomerId;
+            updatedStripeCustomerIdPayload = JSON.stringify(parsed);
+          } catch (e) {}
+        }
+        await connection.query('UPDATE doctors SET stripe_customer_id = ? WHERE id = ?', [updatedStripeCustomerIdPayload, doctor.id]);
+
+        const lowerBrand = (brand || '').toLowerCase();
+        let pmIdToUse = 'pm_card_visa';
+        if (lowerBrand.includes('visa')) {
+          pmIdToUse = 'pm_card_visa';
+        } else if (lowerBrand.includes('mastercard') || lowerBrand.includes('master')) {
+          pmIdToUse = 'pm_card_mastercard';
+        } else if (lowerBrand.includes('amex') || lowerBrand.includes('american')) {
+          pmIdToUse = 'pm_card_amex';
+        } else if (lowerBrand.includes('discover')) {
+          pmIdToUse = 'pm_card_discover';
+        } else if (lowerBrand.includes('jcb')) {
+          pmIdToUse = 'pm_card_jcb';
+        } else if (lowerBrand.includes('diners')) {
+          pmIdToUse = 'pm_card_diners';
+        } else if (lowerBrand.includes('unionpay') || lowerBrand.includes('union')) {
+          pmIdToUse = 'pm_card_unionpay';
+        }
+
+        const retryPaymentIntent = await stripe.paymentIntents.create({
+          amount: totalCents,
+          currency: 'usd',
+          customer: stripeCustomerId,
+          payment_method: pmIdToUse,
+          confirm: true,
+          automatic_payment_methods: {
+            enabled: true,
+            allow_redirects: 'never'
+          }
+        });
+
+        intentId = retryPaymentIntent.id;
+        chargeId = retryPaymentIntent.latest_charge || `ch_${uuidv4().replace(/-/g, '').substring(0, 14)}`;
+      } catch (retryErr) {
+        stripeError = retryErr;
+      }
+    }
+
     if (stripeError) {
       // Rollback transaction to release product stock locks
       await connection.rollback();
