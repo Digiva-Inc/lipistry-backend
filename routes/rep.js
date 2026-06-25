@@ -20,7 +20,7 @@ const uploadFromBuffer = (fileBuffer, folder) => {
       (error, result) => {
         if (result) {
           resolve(result);
-          
+
         } else {
           reject(error);
         }
@@ -121,6 +121,7 @@ router.get('/doctors', async (req, res) => {
 
     query += ` ORDER BY d.practice_name ASC`;
 
+    
     const [doctors] = await pool.query(query, params);
     return res.status(200).json(doctors);
   } catch (error) {
