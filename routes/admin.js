@@ -45,11 +45,11 @@ router.get('/stats', async (req, res) => {
     const [[{ total_doctors }]] = await pool.query("SELECT COUNT(*) AS total_doctors FROM doctors");
     
     // 3. Orders Today
-    const [[{ orders_today }]] = await pool.query("SELECT COUNT(*) AS orders_today FROM orders WHERE DATE(created_at) = CURDATE()");
+    const [[{ orders_today }]] = await pool.query("SELECT COUNT(*) AS orders_today FROM orders WHERE DATE(created_at) = CURDATE() AND status NOT IN ('pending_payment', 'failed_payment')");
     
     // 4. Orders This Month
     const [[{ orders_month }]] = await pool.query(
-      "SELECT COUNT(*) AS orders_month FROM orders WHERE MONTH(created_at) = MONTH(CURDATE()) AND YEAR(created_at) = YEAR(CURDATE())"
+      "SELECT COUNT(*) AS orders_month FROM orders WHERE MONTH(created_at) = MONTH(CURDATE()) AND YEAR(created_at) = YEAR(CURDATE()) AND status NOT IN ('pending_payment', 'failed_payment')"
     );
     
     // 5. Revenue This Month (in cents, coalesced to 0)
@@ -67,6 +67,7 @@ router.get('/stats', async (req, res) => {
        FROM orders o
        JOIN users r ON o.rep_id = r.id
        JOIN doctors d ON o.doctor_id = d.id
+       WHERE o.status NOT IN ('pending_payment', 'failed_payment')
        ORDER BY o.created_at DESC
        LIMIT 10`
     );
@@ -251,7 +252,7 @@ router.get('/products', async (req, res) => {
 
 // 6.5 POST Add Product
 router.post('/products', async (req, res) => {
-  const { name, sku, case_price, units_per_case, description, shopify_product_id, shopify_variant_id, active, images } = req.body;
+  const { name, sku, case_price, units_per_case, description, active, images } = req.body;
 
   if (!name || !sku || case_price === undefined || !units_per_case) {
     return res.status(400).json({ error: 'Name, SKU, Case Price, and Units/Case are required.' });
@@ -268,11 +269,9 @@ router.post('/products', async (req, res) => {
     const newId = uuidv4();
     await pool.query(
       `INSERT INTO products (id, shopify_product_id, shopify_variant_id, name, sku, description, case_price, units_per_case, active, images)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)`,
       [
         newId, 
-        shopify_product_id || null, 
-        shopify_variant_id || null, 
         name, 
         sku, 
         description || null, 
@@ -293,7 +292,7 @@ router.post('/products', async (req, res) => {
 // 6.5 PUT Edit Product
 router.put('/products/:id', async (req, res) => {
   const { id } = req.params;
-  const { name, sku, case_price, units_per_case, description, shopify_product_id, shopify_variant_id, active, images } = req.body;
+  const { name, sku, case_price, units_per_case, description, active, images } = req.body;
 
   if (!name || !sku || case_price === undefined || !units_per_case) {
     return res.status(400).json({ error: 'Name, SKU, Case Price, and Units/Case are required.' });
@@ -315,7 +314,7 @@ router.put('/products/:id', async (req, res) => {
     const imagesStr = Array.isArray(images) ? JSON.stringify(images) : (images || '[]');
     await pool.query(
       `UPDATE products 
-       SET name = ?, sku = ?, case_price = ?, units_per_case = ?, description = ?, shopify_product_id = ?, shopify_variant_id = ?, active = ?, images = ?
+       SET name = ?, sku = ?, case_price = ?, units_per_case = ?, description = ?, shopify_product_id = NULL, shopify_variant_id = NULL, active = ?, images = ?
        WHERE id = ?`,
       [
         name, 
@@ -323,8 +322,6 @@ router.put('/products/:id', async (req, res) => {
         parseInt(case_price), 
         parseInt(units_per_case), 
         description || null, 
-        shopify_product_id || null, 
-        shopify_variant_id || null, 
         active ? 1 : 0, 
         imagesStr,
         id
@@ -513,6 +510,8 @@ router.get('/orders', async (req, res) => {
     if (status) {
       query += ` AND o.status = ?`;
       params.push(status);
+    } else {
+      query += ` AND o.status NOT IN ('pending_payment', 'failed_payment')`;
     }
     if (start_date) {
       query += ` AND o.created_at >= ?`;
@@ -545,7 +544,9 @@ router.get('/orders/:id', async (req, res) => {
               r.name AS rep_name, r.email AS rep_email,
               d.practice_name AS doctor_practice, d.doctor_first_name, d.doctor_last_name,
               d.address_line1, d.address_line2, d.city, d.state, d.zip, d.phone AS doctor_phone, d.email AS doctor_email,
-              d.stripe_customer_id AS stripe_customer_id
+              d.stripe_customer_id AS stripe_customer_id,
+              (SELECT brand FROM payments WHERE order_id = o.id AND status = 'succeeded' ORDER BY created_at DESC LIMIT 1) AS payment_brand,
+              (SELECT last4 FROM payments WHERE order_id = o.id AND status = 'succeeded' ORDER BY created_at DESC LIMIT 1) AS payment_last4
        FROM orders o
        JOIN users r ON o.rep_id = r.id
        JOIN doctors d ON o.doctor_id = d.id
@@ -624,14 +625,17 @@ router.put('/orders/:id/status', async (req, res) => {
         extraSql += ', return_processed_at = CURRENT_TIMESTAMP';
       }
 
-      // If status is refunded, invoke Stripe refund
-      if (status === 'refunded' && currentStatus !== 'refunded') {
-        if (stripeChargeId) {
+      // If status is refunded or returned, invoke Stripe refund
+      if ((status === 'refunded' || status === 'returned') && currentStatus !== 'refunded' && currentStatus !== 'returned') {
+        if (stripeChargeId || stripePaymentIntentId) {
           try {
-            const refund = await stripe.refunds.create({
-              charge: stripeChargeId,
-              amount: totalCents
-            });
+            const refundParams = { amount: totalCents };
+            if (stripeChargeId) {
+              refundParams.charge = stripeChargeId;
+            } else {
+              refundParams.payment_intent = stripePaymentIntentId;
+            }
+            const refund = await stripe.refunds.create(refundParams);
             console.log('Stripe refund processed successfully:', refund.id);
 
             // Log the refund in payments table
