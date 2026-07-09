@@ -50,7 +50,7 @@ router.get('/dashboard', async (req, res) => {
 
     // 2. Total Orders count
     const [[{ order_count }]] = await pool.query(
-      "SELECT COUNT(*) AS order_count FROM orders WHERE rep_id = ?",
+      "SELECT COUNT(*) AS order_count FROM orders WHERE rep_id = ? AND status NOT IN ('pending_payment', 'failed_payment')",
       [repId]
     );
 
@@ -67,7 +67,7 @@ router.get('/dashboard', async (req, res) => {
               d.practice_name AS doctor_practice, d.doctor_first_name, d.doctor_last_name
        FROM orders o
        JOIN doctors d ON o.doctor_id = d.id
-       WHERE o.rep_id = ?
+       WHERE o.rep_id = ? AND o.status NOT IN ('pending_payment', 'failed_payment')
        ORDER BY o.created_at DESC
        LIMIT 10`,
       [repId]
@@ -397,10 +397,10 @@ router.get('/products', async (req, res) => {
   }
 });
 
-// Place New wholesale Order
+// Place New wholesale Order (Draft/Pending Payment)
 router.post('/orders', async (req, res) => {
   const repId = req.user.id;
-  const { doctor_id, items, notes, payment_method } = req.body; // payment_method: 'card_on_file' or 'new_card'
+  const { doctor_id, items, notes } = req.body; 
 
   if (!doctor_id || !items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Doctor ID and at least one catalog item are required.' });
@@ -425,8 +425,6 @@ router.post('/orders', async (req, res) => {
       await connection.rollback();
       return res.status(404).json({ error: 'Doctor account not found or access denied.' });
     }
-
-    const doctor = docRows[0];
 
     // 2. Fetch products, lock rows, validate local stock, and calculate total cents
     let subtotalCents = 0;
@@ -474,215 +472,7 @@ router.post('/orders', async (req, res) => {
 
     const totalCents = subtotalCents;
 
-    // 3. Check card status
-    if (payment_method === 'card_on_file' && !doctor.stripe_customer_id) {
-      await connection.rollback();
-      return res.status(400).json({ error: 'No credit card on file for this practice. Please add one first.' });
-    }
-
-    // 5. Stripe Payment Processing via SDK
-    const stripe = require('../config/stripe');
-    let stripeCustomerId = null;
-    let paymentMethodId = null;
-    let brand = null;
-    let last4 = null;
-
-    if (doctor.stripe_customer_id) {
-      if (doctor.stripe_customer_id.startsWith('{')) {
-        try {
-          const parsed = JSON.parse(doctor.stripe_customer_id);
-          stripeCustomerId = parsed.customerId;
-          paymentMethodId = parsed.paymentMethodId || null;
-          brand = parsed.brand || null;
-          last4 = parsed.last4 || null;
-        } catch (e) {
-          stripeCustomerId = doctor.stripe_customer_id;
-        }
-      } else {
-        stripeCustomerId = doctor.stripe_customer_id;
-      }
-    }
-
-    let chargeId = null;
-    let intentId = null;
-    let stripeError = null;
-
-    try {
-      let pmId = paymentMethodId;
-      if (!pmId && stripeCustomerId) {
-        try {
-          const paymentMethods = await stripe.paymentMethods.list({
-            customer: stripeCustomerId,
-            type: 'card',
-          });
-          if (paymentMethods.data.length > 0) {
-            pmId = paymentMethods.data[0].id;
-          }
-        } catch (err) {
-          console.warn('Could not list Stripe payment methods:', err);
-        }
-      }
-
-      if (!pmId) {
-        // Map mock card brand to test token
-        const lowerBrand = (brand || '').toLowerCase();
-        if (lowerBrand.includes('visa')) {
-          pmId = 'pm_card_visa';
-        } else if (lowerBrand.includes('mastercard') || lowerBrand.includes('master')) {
-          pmId = 'pm_card_mastercard';
-        } else if (lowerBrand.includes('amex') || lowerBrand.includes('american')) {
-          pmId = 'pm_card_amex';
-        } else if (lowerBrand.includes('discover')) {
-          pmId = 'pm_card_discover';
-        } else if (lowerBrand.includes('jcb')) {
-          pmId = 'pm_card_jcb';
-        } else if (lowerBrand.includes('diners')) {
-          pmId = 'pm_card_diners';
-        } else if (lowerBrand.includes('unionpay') || lowerBrand.includes('union')) {
-          pmId = 'pm_card_unionpay';
-        } else {
-          pmId = 'pm_card_visa'; // Fallback test token
-        }
-      }
-
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: totalCents,
-        currency: 'usd',
-        customer: stripeCustomerId || undefined,
-        payment_method: pmId,
-        confirm: true,
-        automatic_payment_methods: {
-          enabled: true,
-          allow_redirects: 'never'
-        }
-      });
-
-      intentId = paymentIntent.id;
-      chargeId = paymentIntent.latest_charge || `ch_${uuidv4().replace(/-/g, '').substring(0, 14)}`;
-    } catch (err) {
-      stripeError = err;
-    }
-
-    if (stripeError && (stripeError.message.includes('No such customer') || stripeError.code === 'resource_missing')) {
-      console.log('Customer not found on Stripe. Re-creating Stripe customer dynamically.');
-      try {
-        stripeError = null;
-        const customer = await stripe.customers.create({
-          email: doctor.email,
-          name: `Dr. ${doctor.doctor_first_name} ${doctor.doctor_last_name} - ${doctor.practice_name}`,
-        });
-        stripeCustomerId = customer.id;
-
-        let updatedStripeCustomerIdPayload = stripeCustomerId;
-        if (doctor.stripe_customer_id && doctor.stripe_customer_id.startsWith('{')) {
-          try {
-            const parsed = JSON.parse(doctor.stripe_customer_id);
-            parsed.customerId = stripeCustomerId;
-            updatedStripeCustomerIdPayload = JSON.stringify(parsed);
-          } catch (e) {}
-        }
-        await connection.query('UPDATE doctors SET stripe_customer_id = ? WHERE id = ?', [updatedStripeCustomerIdPayload, doctor.id]);
-
-        const lowerBrand = (brand || '').toLowerCase();
-        let pmIdToUse = 'pm_card_visa';
-        if (lowerBrand.includes('visa')) {
-          pmIdToUse = 'pm_card_visa';
-        } else if (lowerBrand.includes('mastercard') || lowerBrand.includes('master')) {
-          pmIdToUse = 'pm_card_mastercard';
-        } else if (lowerBrand.includes('amex') || lowerBrand.includes('american')) {
-          pmIdToUse = 'pm_card_amex';
-        } else if (lowerBrand.includes('discover')) {
-          pmIdToUse = 'pm_card_discover';
-        } else if (lowerBrand.includes('jcb')) {
-          pmIdToUse = 'pm_card_jcb';
-        } else if (lowerBrand.includes('diners')) {
-          pmIdToUse = 'pm_card_diners';
-        } else if (lowerBrand.includes('unionpay') || lowerBrand.includes('union')) {
-          pmIdToUse = 'pm_card_unionpay';
-        }
-
-        const retryPaymentIntent = await stripe.paymentIntents.create({
-          amount: totalCents,
-          currency: 'usd',
-          customer: stripeCustomerId,
-          payment_method: pmIdToUse,
-          confirm: true,
-          automatic_payment_methods: {
-            enabled: true,
-            allow_redirects: 'never'
-          }
-        });
-
-        intentId = retryPaymentIntent.id;
-        chargeId = retryPaymentIntent.latest_charge || `ch_${uuidv4().replace(/-/g, '').substring(0, 14)}`;
-      } catch (retryErr) {
-        stripeError = retryErr;
-      }
-    }
-
-    if (stripeError) {
-      // Rollback transaction to release product stock locks
-      await connection.rollback();
-      connection.release();
-      connection = null;
-
-      // Start a separate query to insert failed order and payment log
-      try {
-        await pool.query(
-          `INSERT INTO orders (id, order_number, rep_id, doctor_id, status, stripe_payment_intent_id, stripe_charge_id, subtotal_cents, total_cents, notes)
-           VALUES (?, ?, ?, ?, 'failed_payment', ?, NULL, ?, ?, ?)`,
-          [
-            orderId,
-            orderNumber,
-            repId,
-            doctor_id,
-            stripeError.payment_intent ? stripeError.payment_intent.id : null,
-            subtotalCents,
-            totalCents,
-            notes || null
-          ]
-        );
-
-        for (const d of itemsDetails) {
-          await pool.query(
-            `INSERT INTO order_items (id, order_id, product_id, product_name_snapshot, sku_snapshot, case_price_snapshot, units_per_case, quantity_cases, line_total_cents)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              uuidv4(),
-              orderId,
-              d.product_id,
-              d.name,
-              d.sku,
-              d.case_price,
-              d.units_per_case,
-              d.quantity,
-              d.lineTotal
-            ]
-          );
-        }
-
-        await pool.query(
-          `INSERT INTO payments (id, order_id, stripe_payment_intent_id, stripe_charge_id, amount_cents, currency, status, brand, last4, error_message)
-           VALUES (?, ?, ?, NULL, ?, 'usd', 'failed', ?, ?, ?)`,
-          [
-            uuidv4(),
-            orderId,
-            stripeError.payment_intent ? stripeError.payment_intent.id : null,
-            totalCents,
-            brand,
-            last4,
-            stripeError.message || 'Payment failed'
-          ]
-        );
-      } catch (logErr) {
-        console.error('Failed to log failed order/payment to database:', logErr);
-      }
-
-      console.error('Stripe charge failed:', stripeError);
-      return res.status(402).json({ error: `Payment failed: ${stripeError.message}` });
-    }
-
-    // 6. Deduct local stock & insert inventory transaction audit logs
+    // 3. Deduct local stock & insert inventory transaction audit logs
     for (const d of itemsDetails) {
       await connection.query(
         "UPDATE products SET stock_cases = stock_cases - ? WHERE id = ?",
@@ -692,28 +482,26 @@ router.post('/orders', async (req, res) => {
       await connection.query(
         `INSERT INTO inventory_transactions (product_id, quantity_change, transaction_type, reference_id, notes)
          VALUES (?, ?, 'order_fulfillment', ?, ?)`,
-        [d.product_id, -d.quantity, orderId, `Cases subtracted for order ${orderNumber}`]
+        [d.product_id, -d.quantity, orderId, `Cases reserved for order ${orderNumber}`]
       );
     }
 
-    // 7. Insert Order (Sets status immediately to submitted_warehouse on checkout payment success)
+    // 4. Insert Order (status pending_payment)
     await connection.query(
       `INSERT INTO orders (id, order_number, rep_id, doctor_id, status, stripe_payment_intent_id, stripe_charge_id, subtotal_cents, total_cents, notes)
-       VALUES (?, ?, ?, ?, 'submitted_warehouse', ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, 'pending_payment', NULL, NULL, ?, ?, ?)`,
       [
         orderId,
         orderNumber,
         repId,
         doctor_id,
-        intentId,
-        chargeId,
         subtotalCents,
         totalCents,
         notes || null
       ]
     );
 
-    // 8. Insert Order Items
+    // 5. Insert Order Items
     for (const d of itemsDetails) {
       await connection.query(
         `INSERT INTO order_items (id, order_id, product_id, product_name_snapshot, sku_snapshot, case_price_snapshot, units_per_case, quantity_cases, line_total_cents)
@@ -732,24 +520,9 @@ router.post('/orders', async (req, res) => {
       );
     }
 
-    // 9. Log successful payment in payments table
-    await connection.query(
-      `INSERT INTO payments (id, order_id, stripe_payment_intent_id, stripe_charge_id, amount_cents, currency, status, brand, last4, error_message)
-       VALUES (?, ?, ?, ?, ?, 'usd', 'succeeded', ?, ?, NULL)`,
-      [
-        uuidv4(),
-        orderId,
-        intentId,
-        chargeId,
-        totalCents,
-        brand,
-        last4
-      ]
-    );
-
     await connection.commit();
     return res.status(201).json({
-      message: 'Wholesale order successfully created, paid via Stripe, and submitted to warehouse for fulfillment.',
+      message: 'Order created and pending payment.',
       order_id: orderId,
       order_number: orderNumber
     });
@@ -759,11 +532,216 @@ router.post('/orders', async (req, res) => {
       await connection.rollback();
     }
     console.error('Error placing rep order:', error);
-    return res.status(500).json({ error: 'Failed to place wholesale order.' });
+    return res.status(500).json({ error: 'Failed to create wholesale order.' });
   } finally {
     if (connection) {
       connection.release();
     }
+  }
+});
+
+// Create Stripe Checkout Session for an existing pending order
+router.post('/orders/create-checkout-session', async (req, res) => {
+  const repId = req.user.id;
+  const { orderId } = req.body;
+
+  try {
+    // 1. Fetch Order and Doctor
+    const [orderRows] = await pool.query(
+      `SELECT o.*, d.email, d.practice_name, d.doctor_first_name, d.doctor_last_name, d.stripe_customer_id, d.id as doc_id
+       FROM orders o
+       JOIN doctors d ON o.doctor_id = d.id
+       WHERE o.id = ? AND o.rep_id = ?`,
+      [orderId, repId]
+    );
+
+    if (orderRows.length === 0) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    const order = orderRows[0];
+    if (order.status !== 'pending_payment' && order.status !== 'failed_payment') {
+      return res.status(400).json({ error: `Order cannot be paid because it is in status: ${order.status}` });
+    }
+
+    const totalCents = order.total_cents;
+    const stripe = require('../config/stripe');
+
+    // Parse stripe_customer_id if it's a JSON string
+    let stripeCustomerId = null;
+    if (order.stripe_customer_id) {
+      if (order.stripe_customer_id.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(order.stripe_customer_id);
+          stripeCustomerId = parsed.customerId;
+        } catch (e) {
+          stripeCustomerId = order.stripe_customer_id;
+        }
+      } else {
+        stripeCustomerId = order.stripe_customer_id;
+      }
+    }
+
+    // Create a new customer dynamically if none exists for this doctor
+    if (!stripeCustomerId) {
+      try {
+        const customer = await stripe.customers.create({
+          email: order.email,
+          name: `Dr. ${order.doctor_first_name} ${order.doctor_last_name} - ${order.practice_name}`,
+        });
+        stripeCustomerId = customer.id;
+
+        // Save back to DB
+        await pool.query('UPDATE doctors SET stripe_customer_id = ? WHERE id = ?', [stripeCustomerId, order.doc_id]);
+      } catch (err) {
+        console.warn('Could not create Stripe customer:', err);
+      }
+    }
+
+    // Fetch actual line items
+    const [orderItems] = await pool.query(`
+      SELECT oi.*, p.name as product_name
+      FROM order_items oi
+      JOIN products p ON oi.product_id = p.id
+      WHERE oi.order_id = ?
+    `, [orderId]);
+
+    const stripeLineItems = orderItems.map(item => ({
+      price_data: {
+        currency: 'inr',
+        product_data: {
+          name: item.product_name,
+          description: `Case of ${item.units_per_case} units (SKU: ${item.sku_snapshot})`,
+        },
+        unit_amount: item.case_price_snapshot,
+      },
+      quantity: item.quantity_cases,
+    }));
+
+    const clientUrl = process.env.CLIENT_URL;
+
+    // 2. Create Checkout Session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card', 'upi'],
+      customer: stripeCustomerId || undefined,
+      client_reference_id: orderId,
+      expires_at: Math.floor(Date.now() / 1000) + (30 * 60), // Stripe minimum expiration is 30 minutes
+      line_items: stripeLineItems,
+      mode: 'payment',
+      success_url: `${clientUrl}/rep/orders/confirmation?id=${orderId}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/rep/orders/pay?id=${orderId}`,
+    });
+
+    // Save session ID to order
+    await pool.query('UPDATE orders SET stripe_checkout_session_id = ? WHERE id = ?', [session.id, orderId]);
+
+    return res.status(200).json({ url: session.url });
+
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    return res.status(500).json({ error: 'Failed to initialize payment gateway.' });
+  }
+});
+
+// Verify Payment Realtime Fallback
+router.get('/orders/:id/verify-payment', async (req, res) => {
+  const repId = req.user.id;
+  const orderId = req.params.id;
+  const querySessionId = req.query.session_id;
+
+  try {
+    const stripe = require('../config/stripe');
+    // Verify ownership
+    const [orders] = await pool.query('SELECT * FROM orders WHERE id = ? AND rep_id = ?', [orderId, repId]);
+    if (orders.length === 0) return res.status(404).json({ error: 'Order not found.' });
+
+    const order = orders[0];
+    const sessionId = querySessionId || order.stripe_checkout_session_id;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: 'Missing session ID.' });
+    }
+
+    // Retrieve session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if ((session.payment_status === 'paid' || session.status === 'complete') && (order.status === 'pending_payment' || order.status === 'failed_payment' || order.status === 'draft')) {
+      // Sync it locally!
+      await pool.query(
+        "UPDATE orders SET status = 'submitted_warehouse', stripe_payment_intent_id = ? WHERE id = ?",
+        [session.payment_intent, order.id]
+      );
+      console.log(`Fallback Verification: Order ${order.order_number} marked as paid.`);
+
+      // Log to the payments table since webhooks aren't running locally
+      const [existingPayments] = await pool.query(
+        'SELECT * FROM payments WHERE order_id = ? AND status = "succeeded"',
+        [order.id]
+      );
+
+      if (existingPayments.length === 0) {
+        let brand = 'Unknown';
+        let last4 = '0000';
+        let chargeId = null;
+
+        // Try to fetch payment intent details
+        if (session.payment_intent) {
+          try {
+             const pi = await stripe.paymentIntents.retrieve(session.payment_intent);
+             chargeId = pi.latest_charge || null;
+             if (pi.payment_method_details?.card) {
+               brand = pi.payment_method_details.card.brand;
+               last4 = pi.payment_method_details.card.last4;
+             } else if (pi.payment_method_details?.upi) {
+               brand = 'UPI / QR Code';
+               last4 = pi.payment_method_details.upi.vpa || 'unknown';
+             }
+          } catch (e) {
+             console.warn("Failed to fetch payment intent details for logging", e);
+          }
+        }
+
+        await pool.query(
+          `INSERT INTO payments (id, order_id, stripe_payment_intent_id, stripe_charge_id, amount_cents, currency, status, brand, last4, error_message)
+           VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, NULL)`,
+          [uuidv4(), order.id, session.payment_intent || null, chargeId, session.amount_total, session.currency || 'inr', brand, last4]
+        );
+      }
+
+      return res.status(200).json({ message: 'Order successfully verified and updated.' });
+    }
+
+    return res.status(200).json({ message: 'Order status unchanged.' });
+  } catch (error) {
+    console.error('Error verifying payment:', error);
+    return res.status(500).json({ error: 'Failed to verify payment.' });
+  }
+});
+
+// Mark Paid Direct (for Personal UPI)
+router.post('/orders/:id/mark-paid-direct', async (req, res) => {
+  const repId = req.user.id;
+  const orderId = req.params.id;
+
+  try {
+    // Verify ownership
+    const [orders] = await pool.query('SELECT * FROM orders WHERE id = ? AND rep_id = ?', [orderId, repId]);
+    if (orders.length === 0) return res.status(404).json({ error: 'Order not found.' });
+
+    const order = orders[0];
+    
+    if (order.status === 'pending_payment' || order.status === 'failed_payment' || order.status === 'draft') {
+      await pool.query(
+        "UPDATE orders SET status = 'submitted_warehouse', stripe_payment_intent_id = 'direct_upi' WHERE id = ?",
+        [order.id]
+      );
+      return res.status(200).json({ message: 'Order successfully marked as paid via Direct UPI.' });
+    }
+
+    return res.status(400).json({ error: 'Order is not in a valid state to be marked as paid.' });
+  } catch (error) {
+    console.error('Error marking order paid direct:', error);
+    return res.status(500).json({ error: 'Failed to process payment status.' });
   }
 });
 

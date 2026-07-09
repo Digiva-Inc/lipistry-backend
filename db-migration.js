@@ -60,6 +60,7 @@ async function migrate() {
     await addColumnIfNotExists('orders', 'return_proof_image',   'TEXT NULL');
     await addColumnIfNotExists('orders', 'return_requested_at',  'TIMESTAMP NULL');
     await addColumnIfNotExists('orders', 'return_processed_at',  'TIMESTAMP NULL');
+    await addColumnIfNotExists('orders', 'stripe_checkout_session_id', 'VARCHAR(255) NULL');
 
     // ── PAYMENTS TABLE ─────────────────────────────────────────────
     console.log('\n[ Payments Table ]');

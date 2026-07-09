@@ -31,13 +31,46 @@ router.post('/webhook', async (req, res) => {
   console.log(`✉️ Received Stripe Webhook Event: ${type}`);
 
   try {
-    if (type === 'payment_intent.succeeded') {
+    if (type === 'checkout.session.completed') {
+      const session = data.object;
+      const orderId = session.client_reference_id;
+      const intentId = session.payment_intent;
+      const totalCents = session.amount_total;
+      const currency = session.currency || 'usd';
+
+      if (orderId) {
+        // Find order by ID
+        const [orders] = await pool.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+        if (orders.length > 0) {
+          const order = orders[0];
+
+          if (order.status === 'draft' || order.status === 'failed_payment' || order.status === 'pending_payment') {
+            await pool.query(
+              "UPDATE orders SET status = 'submitted_warehouse', stripe_payment_intent_id = ? WHERE id = ?",
+              [intentId, order.id]
+            );
+            console.log(`Order ${order.order_number} marked as paid & submitted to warehouse via Checkout Webhook.`);
+          }
+
+          // We'll let the payment_intent.succeeded webhook handle logging the specific card brand/last4 
+          // to the payments table since the session doesn't easily have that nested.
+        }
+      }
+    } else if (type === 'payment_intent.succeeded') {
       const paymentIntent = data.object;
       const intentId = paymentIntent.id;
       const chargeId = paymentIntent.latest_charge || null;
       const totalCents = paymentIntent.amount;
-      const brand = paymentIntent.payment_method_details?.card?.brand || null;
-      const last4 = paymentIntent.payment_method_details?.card?.last4 || null;
+      const currency = paymentIntent.currency || 'usd';
+      
+      let brand = paymentIntent.payment_method_details?.card?.brand || null;
+      let last4 = paymentIntent.payment_method_details?.card?.last4 || null;
+
+      // Handle UPI / QR Code payments
+      if (!brand && paymentIntent.payment_method_details?.upi) {
+        brand = 'UPI / QR Code';
+        last4 = paymentIntent.payment_method_details.upi.vpa || 'unknown';
+      }
 
       // Find order by payment intent ID
       const [orders] = await pool.query('SELECT * FROM orders WHERE stripe_payment_intent_id = ?', [intentId]);
@@ -51,6 +84,11 @@ router.post('/webhook', async (req, res) => {
             [chargeId, order.id]
           );
           console.log(`Order ${order.order_number} marked as paid & submitted to warehouse via Webhook.`);
+        } else if (chargeId) {
+          await pool.query(
+            "UPDATE orders SET stripe_charge_id = ? WHERE id = ?",
+            [chargeId, order.id]
+          );
         }
 
         // 2. Check if payment log already exists
@@ -63,8 +101,8 @@ router.post('/webhook', async (req, res) => {
           // Log payment
           await pool.query(
             `INSERT INTO payments (id, order_id, stripe_payment_intent_id, stripe_charge_id, amount_cents, currency, status, brand, last4, error_message)
-             VALUES (?, ?, ?, ?, ?, 'usd', 'succeeded', ?, ?, NULL)`,
-            [uuidv4(), order.id, intentId, chargeId, totalCents, brand, last4]
+             VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, NULL)`,
+            [uuidv4(), order.id, intentId, chargeId, totalCents, currency, brand, last4]
           );
           console.log(`Successful payment logged for order ${order.order_number} via Webhook.`);
         }
@@ -76,6 +114,7 @@ router.post('/webhook', async (req, res) => {
       const paymentIntent = data.object;
       const intentId = paymentIntent.id;
       const totalCents = paymentIntent.amount;
+      const currency = paymentIntent.currency || 'usd';
       const errorMessage = paymentIntent.last_payment_error?.message || 'Payment failed';
 
       // Find order
@@ -91,8 +130,8 @@ router.post('/webhook', async (req, res) => {
         // Log the failure
         await pool.query(
           `INSERT INTO payments (id, order_id, stripe_payment_intent_id, stripe_charge_id, amount_cents, currency, status, brand, last4, error_message)
-           VALUES (?, ?, ?, NULL, ?, 'usd', 'failed', NULL, NULL, ?)`,
-          [uuidv4(), order.id, intentId, totalCents, errorMessage]
+           VALUES (?, ?, ?, NULL, ?, ?, 'failed', NULL, NULL, ?)`,
+          [uuidv4(), order.id, intentId, totalCents, currency, errorMessage]
         );
         console.log(`Failed payment logged for order ${order.order_number} via Webhook.`);
       }
@@ -102,6 +141,7 @@ router.post('/webhook', async (req, res) => {
       const chargeId = charge.id;
       const refundId = charge.refunds?.data[0]?.id || null;
       const totalCents = charge.amount_refunded || charge.amount;
+      const currency = charge.currency || 'usd';
 
       // Find order by charge ID
       const [orders] = await pool.query('SELECT * FROM orders WHERE stripe_charge_id = ?', [chargeId]);
@@ -126,8 +166,8 @@ router.post('/webhook', async (req, res) => {
           // Log refund
           await pool.query(
             `INSERT INTO payments (id, order_id, stripe_payment_intent_id, stripe_charge_id, amount_cents, currency, status, brand, last4, error_message)
-             VALUES (?, ?, ?, ?, ?, 'usd', 'refunded', NULL, NULL, NULL)`,
-            [uuidv4(), order.id, order.stripe_payment_intent_id || null, refundId || chargeId, -totalCents]
+             VALUES (?, ?, ?, ?, ?, ?, 'refunded', NULL, NULL, NULL)`,
+            [uuidv4(), order.id, order.stripe_payment_intent_id || null, refundId || chargeId, -totalCents, currency]
           );
           console.log(`Refund logged for order ${order.order_number} via Webhook.`);
         }
